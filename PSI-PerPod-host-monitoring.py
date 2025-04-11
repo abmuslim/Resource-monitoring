@@ -1,63 +1,101 @@
-import subprocess
+import os
 import time
-import sys
 import csv
-from datetime import datetime
+import subprocess
+import sys
 
-def get_container_ids():
-    result = subprocess.run(["docker", "ps", "-q"], stdout=subprocess.PIPE)
-    return result.stdout.decode().splitlines()
+warned_pids = set()
 
-def get_container_pid(cid):
-    result = subprocess.run(["docker", "inspect", "--format", "{{.State.Pid}}", cid], stdout=subprocess.PIPE)
-    return result.stdout.decode().strip()
+def get_container_info():
+    output = subprocess.check_output("docker ps --format '{{.ID}} {{.Names}}'", shell=True).decode().strip()
+    info = {}
+    for line in output.splitlines():
+        cid, name = line.split()
+        pid = subprocess.check_output(f"docker inspect --format '{{{{.State.Pid}}}}' {cid}", shell=True).decode().strip()
+        info[name] = int(pid)
+    return info
 
-def read_cpu_pressure(path):
+def find_psi_path(pid):
+    root = f"/proc/{pid}/root/sys/fs/cgroup"
+    for dirpath, _, filenames in os.walk(root):
+        if "cpu.pressure" in filenames:
+            return os.path.join(dirpath, "cpu.pressure")
+    return None
+
+def read_avg60_from_cgroup(pid):
+    psi_path = find_psi_path(pid)
+    if not psi_path:
+        if pid not in warned_pids:
+            print(f"[WARN] Could not locate cpu.pressure for PID {pid}")
+            warned_pids.add(pid)
+        return 0.0
     try:
-        with open(path, "r") as f:
-            data = f.read()
-        for line in data.splitlines():
-            if line.startswith("some"):
-                return line.split()
+        with open(psi_path, "r") as f:
+            for line in f:
+                if line.startswith("some"):
+                    for part in line.split():
+                        if part.startswith("avg60="):
+                            return float(part.split("=")[1])
     except Exception as e:
-        return [f"Error: {e}"]
-    return ["N/A"]
+        print(f"[ERROR] Reading PSI from {psi_path}: {e}")
+        return 0.0
+    return 0.0
 
-def monitor_psi(duration_sec=300, interval_sec=10):
-    end_time = time.time() + duration_sec
-    filename = "psi_monitoring_log.csv"
+def read_avg60_host():
+    try:
+        with open("/proc/pressure/cpu", "r") as f:
+            for line in f:
+                if line.startswith("some"):
+                    for part in line.split():
+                        if part.startswith("avg60="):
+                            return float(part.split("=")[1])
+    except Exception as e:
+        print(f"[WARN] Failed to read host PSI: {e}")
+        return 0.0
+    return 0.0
 
-    with open(filename, mode="w", newline="") as file:
-        writer = csv.writer(file)
-        # CSV header
-        writer.writerow(["timestamp", "source", "avg10", "avg60", "avg300", "total"])
+def monitor_psi(duration_sec, interval_sec=10):
+    fieldnames = ["seconds", "host"]
+    container_names_set = set()
+    rows = []
 
-        while time.time() < end_time:
-            timestamp = datetime.utcnow().isoformat()
+    start_time = time.time()
+    while time.time() - start_time < duration_sec:
+        current_sec = int(time.time() - start_time)
+        container_info = get_container_info()
 
-            # Host-level PSI
-            host_psi_path = "/proc/pressure/cpu"
-            host_metrics = read_cpu_pressure(host_psi_path)
-            if len(host_metrics) == 5:
-                writer.writerow([timestamp, "host"] + host_metrics[1:])
+        row = {"seconds": current_sec}
 
-            # Per-container PSI
-            for cid in get_container_ids():
-                pid = get_container_pid(cid)
-                psi_path = f"/proc/{pid}/root/sys/fs/cgroup/cpu.pressure"
-                metrics = read_cpu_pressure(psi_path)
-                if len(metrics) == 5:
-                    writer.writerow([timestamp, cid] + metrics[1:])
+        for name, pid in container_info.items():
+            row[name] = read_avg60_from_cgroup(pid)
 
-            file.flush()
-            time.sleep(interval_sec)
+            if name not in container_names_set:
+                container_names_set.add(name)
+                fieldnames.insert(-1, name)  # insert before 'host'
 
-    print(f"✅ Monitoring complete. Logs saved to: {filename}")
+        row["host"] = read_avg60_host()
+        rows.append(row)
+
+        time.sleep(interval_sec)
+
+    # Ensure all rows contain all fields
+    for row in rows:
+        for field in fieldnames:
+            if field not in row:
+                row[field] = ""
+
+    with open("avg60_psi_log.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python3 PSI-PerPod&host-monitoring.py <duration_seconds>")
+    if os.geteuid() != 0:
+        print("⚠️  This script must be run with sudo.")
+        sys.exit(1)
+    if len(sys.argv) < 2:
+        print("Usage: sudo python3 PSI-PerPod-host-monitoring.py <duration_in_seconds>")
         sys.exit(1)
 
     duration = int(sys.argv[1])
-    monitor_psi(duration_sec=duration)
+    monitor_psi(duration)
